@@ -28,15 +28,14 @@ Default config: E=2 encoders × Q=4 qubits → 8-dim latent, R=3 re-uploads, ~24
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `main.py` | Quantum model classes (`MultiEncoderDR`, `ReuploadingPQC`, `HybridQuantumHead`) and training loop |
-| `data_loader.py` | UltraFeedback preference dataset loader + BGE embedding cache |
-| `classical_baseline.py` | `MLP`, `train_mlp()`, `train_logistic_regression()`, `train_linear_svm()` |
-| `benchmark.py` | Orchestrates all models across all problem spaces; generates charts + reports |
-| `problem_spaces/financial.py` | Twitter financial news sentiment (Bearish vs Bullish) |
-| `problem_spaces/molecular.py` | Blood-brain barrier penetration — BBBP via RDKit Morgan fingerprints |
-| `problem_spaces/clinical.py` | Adverse drug event detection — ADE Corpus v2 |
+| File                          | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `hybrid_classifier.py`        | Quantum model classes (`MultiEncoderDR`, `ReuploadingPQC`, `HybridQuantumHead`) and training loop |
+| `data_loader.py`              | UltraFeedback preference dataset loader + BGE embedding cache                                     |
+| `classical_baseline.py`       | `MLP`, `train_mlp()`, `train_logistic_regression()`, `train_linear_svm()`                         |
+| `benchmark.py`                | Orchestrates all models across all problem spaces; generates charts + reports                     |
+| `problem_spaces/financial.py` | Twitter financial news sentiment (Bearish vs Bullish)                                             |
+| `problem_spaces/clinical.py`  | Adverse drug event detection — ADE Corpus v2                                                      |
 
 ---
 
@@ -46,15 +45,11 @@ Default config: E=2 encoders × Q=4 qubits → 8-dim latent, R=3 re-uploads, ~24
 # Activate environment
 myenv\Scripts\activate
 
-# Run the quantum model alone (UltraFeedback dataset)
-python main.py
-
-# Run full benchmark — all three problem spaces
+# Run full benchmark — both problem spaces
 python benchmark.py
 
 # Run a single problem space
 python benchmark.py financial
-python benchmark.py molecular
 python benchmark.py clinical
 ```
 
@@ -70,7 +65,6 @@ outputs/
     05_confusion_matrices.png
     06_roc_curves.png
     report.md
-  molecular/   (same structure)
   clinical/    (same structure)
 ```
 
@@ -79,18 +73,14 @@ outputs/
 ## Problem Spaces
 
 ### Financial News Sentiment
+
 - **Dataset**: `zeroshot/twitter-financial-news-sentiment` (HuggingFace)
 - **Task**: Bearish (0) vs Bullish (2) — neutral dropped
 - **Features**: 768-dim BGE-base-en-v1.5 embeddings
 - **Enterprise case**: Portfolio risk monitoring, earnings signal generation
 
-### Molecular Property Prediction
-- **Dataset**: MoleculeNet BBBP (blood-brain barrier penetration, 2,050 molecules)
-- **Task**: Non-permeable (0) vs Permeable (1)
-- **Features**: 1024-bit Morgan fingerprints (radius=2) via RDKit
-- **Enterprise case**: CNS drug discovery — quantum circuits have principled theoretical motivation for molecular data
-
 ### Adverse Drug Event Detection
+
 - **Dataset**: `ade_corpus_v2` — Ade_corpus_v2_classification (HuggingFace)
 - **Task**: Not ADE-related (0) vs ADE-related (1)
 - **Features**: 768-dim BGE-base-en-v1.5 embeddings
@@ -102,17 +92,11 @@ outputs/
 
 All three are trained with matched budgets where applicable:
 
-| Model | Notes |
-|-------|-------|
-| Logistic Regression | L2-regularised, direct fit on raw features |
-| Linear SVM | LinearSVC + Platt calibration for ROC curves |
-| MLP | 2-layer ReLU net sized to ~match quantum param count; same Adam/LR/epochs |
-
----
-
-## Key Findings (UltraFeedback run)
-
-All models clustered at ~0.51 accuracy (near random) on the UltraFeedback preference task — the signal is not accessible in BGE embedding space for that task. The quantum model trained in ~455s vs ~7s for MLP with no accuracy benefit. This is expected: the task was mis-matched. The three problem spaces above were selected specifically because they have non-linear structure in embedding space where the quantum head has a realistic chance to add value.
+| Model               | Notes                                                                     |
+| ------------------- | ------------------------------------------------------------------------- |
+| Logistic Regression | L2-regularised, direct fit on raw features                                |
+| Linear SVM          | LinearSVC + Platt calibration for ROC curves                              |
+| MLP                 | 2-layer ReLU net sized to ~match quantum param count; same Adam/LR/epochs |
 
 ---
 
@@ -135,5 +119,29 @@ numpy
 
 Install: `myenv\Scripts\pip install matplotlib seaborn rdkit`
 
-### IonQ Simulator (future work)
-The `PennyLane-IonQ` plugin is installed. To route the PQC through IonQ's cloud trapped-ion noise model, set `IONQ_API_KEY` in your environment and change the PQC device in `main.py` from `default.qubit` (local statevector) to `ionq.simulator` with `diff_method="parameter-shift"`. The recommended approach is to train locally then evaluate the trained circuit on the IonQ simulator to measure the noise gap.
+### IonQ Backend — Attempt & Findings
+
+We attempted to swap the re-uploading PQC backend from local statevector simulation to the IonQ cloud trapped-ion noise model, following the paper's intent of running the data re-uploading step on real hardware. The encoder (`MultiEncoderDR`) was kept on `default.qubit` (ideal noiseless statevector), matching the paper's two-backend design.
+
+**What was implemented**
+
+- PQC device changed to `ionq.simulator` (via `pennylane-ionq`) with `shots=1024`
+- API key read from the `IONQ_API_KEY` environment variable
+- `TorchLayer` replaced with a manual per-sample loop to avoid broadcasted tapes, which IonQ does not support
+- Gradient method changed from `backprop` to `parameter-shift` (required for shot-based remote devices)
+
+**Errors encountered and resolved**
+
+| Error | Fix |
+|-------|-----|
+| `ValueError: ionq device does not support analytic expectation values` | Added `shots=1024` |
+| `NotImplementedError: parameter-shift does not support broadcasted tapes` | Replaced `TorchLayer` with a manual batch loop, one QNode call per sample |
+| `RuntimeError: mat1 and mat2 must have the same dtype (Double vs Float)` | Cast QNode outputs to `float32` |
+
+**Why it was reverted**
+
+Training was prohibitively slow. The root cause is the backward pass: `parameter-shift` requires **2 additional IonQ API calls per trainable weight per sample**. With 96 PQC weights and a batch size of 16, each optimizer step dispatches ~3,072 sequential remote API calls. At typical IonQ simulator latency this makes a 100-epoch training run impractical. Threading the forward pass would reduce that cost by ~16× but leaves the dominant backward-pass overhead untouched, yielding negligible net speedup.
+
+**Recommended path forward**
+
+Train on `default.qubit` (as currently implemented), then run a single forward-pass evaluation of the trained weights on `ionq.simulator` to quantify the noise gap — without incurring gradient overhead. This is the most cost-effective way to characterise hardware noise effects on this model.

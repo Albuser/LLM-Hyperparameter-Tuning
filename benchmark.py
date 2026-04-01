@@ -8,12 +8,11 @@ sub-folder under outputs/ for each one.
 Run:
     python benchmark.py                  # all problem spaces
     python benchmark.py financial        # single space by key
-    python benchmark.py molecular clinical
+    python benchmark.py financial clinical
 
 outputs/
   financial/
     01_accuracy_comparison.png  ...  06_roc_curves.png  report.md
-  molecular/
     ...
   clinical/
     ...
@@ -24,6 +23,7 @@ import sys
 import time
 import datetime
 import argparse
+import joblib
 
 import numpy as np
 import torch
@@ -41,7 +41,7 @@ from sklearn.metrics import (
     roc_auc_score, roc_curve, classification_report,
 )
 
-from main import (
+from hybrid_classifier import (
     HybridQuantumHead,
     N_ENCODERS, QUBITS_PER_ENCODER, N_LAYERS_ENCODER,
     N_REUPLOADS, N_LAYERS_PER_REUPLOAD, NUM_CLASSES,
@@ -226,6 +226,11 @@ def run_problem_space(ps: dict) -> dict:
         "history": q_h, "timing": q_t,
         "eval": evaluate(q_m, x_test, y_test, is_torch=True, class_names=class_names),
     }
+
+    torch.save(q_m.state_dict(), os.path.join(out_dir, "quantum_head_model.pth"))
+    joblib.dump(lr_m,  os.path.join(out_dir, "logistic_regression.joblib"))
+    joblib.dump(svm_m, os.path.join(out_dir, "linear_svm.joblib"))
+    torch.save(mlp_m.state_dict(), os.path.join(out_dir, "mlp_model.pth"))
 
     # ── Outputs ───────────────────────────────────────────
     print("\n[3/3] Generating charts and report...")

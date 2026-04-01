@@ -10,7 +10,7 @@ EMBED_DIM = 768          # BGE-base-en-v1.5 output dimension
 N_ENCODERS = 2           # E: parallel simulated quantum encoders
 QUBITS_PER_ENCODER = 4   # Q per encoder  →  latent_dim = E * Q = 8
 N_LAYERS_ENCODER = 1     # variational layers inside each sQE
-N_REUPLOADS = 3          # R: data re-uploading repetitions in the PQC
+N_REUPLOADS = 4          # R: data re-uploading repetitions in the PQC
 N_LAYERS_PER_REUPLOAD = 1  # M: entangling layers per re-upload block
 NUM_CLASSES = 2
 BATCH_SIZE = 16
@@ -21,7 +21,8 @@ LR = 0.01
 # ==================== QUANTUM COMPONENTS ====================
 
 def _make_encoder_qlayer(qubits: int, n_layers: int) -> qml.qnn.TorchLayer:
-    """Factory: one sQE QNode as a TorchLayer (amplitude encoding + variational circuit)."""
+    """Factory: one sQE QNode as a TorchLayer (amplitude encoding + variational circuit).
+    Uses ideal noiseless statevector simulation."""
     dev = qml.device("default.qubit", wires=qubits)
 
     @qml.qnode(dev, interface="torch", diff_method="backprop")
@@ -34,7 +35,8 @@ def _make_encoder_qlayer(qubits: int, n_layers: int) -> qml.qnn.TorchLayer:
 
 
 def _make_pqc_qlayer(n_qubits: int, n_reuploads: int, n_layers: int) -> qml.qnn.TorchLayer:
-    """Factory: re-uploading PQC QNode as a TorchLayer (angle encoding + variational circuit)."""
+    """Factory: re-uploading PQC QNode as a TorchLayer (angle encoding + variational circuit).
+    Uses ideal noiseless statevector simulation."""
     dev = qml.device("default.qubit", wires=n_qubits)
 
     @qml.qnode(dev, interface="torch", diff_method="backprop")
@@ -78,7 +80,8 @@ class MultiEncoderDR(nn.Module):
 
 class ReuploadingPQC(nn.Module):
     """Re-uploading PQC: angle-encodes the latent vector R times interleaved with
-    variational layers. Measures all qubits → (B, n_qubits) output."""
+    variational layers. Measures all qubits → (B, n_qubits) output.
+    Runs each sample individually to avoid broadcasted tapes on the IonQ device."""
 
     def __init__(self, n_qubits: int, n_reuploads: int = 3, n_layers: int = 1):
         super().__init__()
