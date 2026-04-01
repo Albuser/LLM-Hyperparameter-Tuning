@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual environment
+myenv/
+venv/
+env/
+
+# Cached embeddings (regenerated automatically on first run)
+cached_files/
+
+# OS
+.DS_Store
+Thumbs.db
