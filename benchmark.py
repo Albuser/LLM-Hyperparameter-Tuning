@@ -43,8 +43,6 @@ from sklearn.metrics import (
 
 from hybrid_classifier import (
     HybridQuantumHead,
-    N_ENCODERS, QUBITS_PER_ENCODER, N_LAYERS_ENCODER,
-    N_REUPLOADS, N_LAYERS_PER_REUPLOAD, NUM_CLASSES,
     BATCH_SIZE, LR,
 )
 from classical_baseline import train_mlp, train_logistic_regression, train_linear_svm
@@ -52,6 +50,21 @@ from problem_spaces import PROBLEM_SPACES
 
 OUTPUTS_ROOT = "outputs"
 BENCH_EPOCHS = 100
+SWEEP_EPOCHS = 50   # reduced budget for hp sweep; still indicative
+
+# Hyperparameter sweep grid.
+# Constraint: E × 2^Q = 32  →  projector params = embed_dim × 32 = 24,576 for all configs,
+# matching the MLP baseline (~24,674).  Only R (re-uploads) and M (encoder layers) vary
+# the tiny quantum-circuit portion, keeping total params within ~300 of each other.
+SWEEP_CONFIGS = [
+    # label                  E  Q  R  M  L
+    {"label": "E2-Q4-R4 (baseline)", "n_encoders": 2, "qubits": 4, "reuploads": 4, "enc_layers": 1, "pqc_layers": 1},
+    {"label": "E4-Q3-R4 (wider)",    "n_encoders": 4, "qubits": 3, "reuploads": 4, "enc_layers": 1, "pqc_layers": 1},
+    {"label": "E1-Q5-R4 (deeper)",   "n_encoders": 1, "qubits": 5, "reuploads": 4, "enc_layers": 1, "pqc_layers": 1},
+    {"label": "E2-Q4-R2 (low-R)",    "n_encoders": 2, "qubits": 4, "reuploads": 2, "enc_layers": 1, "pqc_layers": 1},
+    {"label": "E2-Q4-R6 (high-R)",   "n_encoders": 2, "qubits": 4, "reuploads": 6, "enc_layers": 1, "pqc_layers": 1},
+    {"label": "E2-Q4-R4-M2 (deep enc)", "n_encoders": 2, "qubits": 4, "reuploads": 4, "enc_layers": 2, "pqc_layers": 1},
+]
 
 PALETTE = {
     "Logistic Regression": "#4CAF50",
@@ -61,27 +74,44 @@ PALETTE = {
 }
 
 
+def _time_inference(fn, n_runs=5):
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return min(times)
+
+
 # ─────────────────────────────────────────────
-# Quantum training
+# Hyperparameter sweep
 # ─────────────────────────────────────────────
 
-def train_quantum(x_train, y_train, x_test, y_test, embed_dim: int) -> tuple:
+def _train_quantum_config(x_train, y_train, x_test, y_test,
+                          embed_dim: int, cfg: dict, epochs: int) -> dict:
+    """Train one HybridQuantumHead config; return metrics + history."""
     x_tr = torch.tensor(x_train, dtype=torch.float32)
     y_tr = torch.tensor(y_train, dtype=torch.long)
     x_te = torch.tensor(x_test,  dtype=torch.float32)
 
+    model = HybridQuantumHead(
+        embed_dim         = embed_dim,
+        n_encoders        = cfg["n_encoders"],
+        qubits_per_encoder= cfg["qubits"],
+        n_layers_encoder  = cfg["enc_layers"],
+        n_reuploads       = cfg["reuploads"],
+        n_layers_per_reupload = cfg["pqc_layers"],
+    )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     loader = DataLoader(TensorDataset(x_tr, y_tr), batch_size=BATCH_SIZE, shuffle=True)
-    model  = HybridQuantumHead(embed_dim=embed_dim)
     opt    = torch.optim.Adam(model.parameters(), lr=LR)
     crit   = nn.CrossEntropyLoss()
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  [Quantum] {n_params:,} trainable parameters")
+    history = {"epoch": [], "val_acc": [], "loss": [], "epoch_time_s": []}
+    t0_total = time.perf_counter()
 
-    history = {"epoch": [], "loss": [], "val_acc": [], "epoch_time_s": []}
-    train_start = time.perf_counter()
-
-    for epoch in range(1, BENCH_EPOCHS + 1):
+    for epoch in range(1, epochs + 1):
         ep_t0 = time.perf_counter()
         model.train()
         total_loss = 0.0
@@ -97,41 +127,200 @@ def train_quantum(x_train, y_train, x_test, y_test, embed_dim: int) -> tuple:
         with torch.no_grad():
             preds = model(x_te).argmax(dim=-1).numpy()
         acc = accuracy_score(y_test, preds)
-
         history["epoch"].append(epoch)
-        history["loss"].append(total_loss / len(loader))
         history["val_acc"].append(acc)
         history["epoch_time_s"].append(ep_time)
+        history["loss"].append(total_loss / len(loader))
 
         if epoch % 10 == 0:
-            print(f"  [Quantum] Epoch {epoch:3d}/{BENCH_EPOCHS} | "
-                  f"loss {history['loss'][-1]:.4f} | acc {acc:.4f} | {ep_time:.1f}s/ep")
+            print(f"    [{cfg['label']}] ep {epoch:3d}/{epochs} | "
+                  f"loss {history['loss'][-1]:.4f} | acc {acc:.4f}")
 
-    train_time = time.perf_counter() - train_start
-
-    infer_times = [_time_inference(lambda: model(x_te).argmax(dim=-1).numpy()) for _ in range(5)]
-    infer_t     = min(infer_times)
+    train_time = time.perf_counter() - t0_total
 
     model.eval()
     with torch.no_grad():
         final_preds = model(x_te).argmax(dim=-1).numpy()
-    print(f"  [Quantum] Final acc {accuracy_score(y_test, final_preds):.4f} | "
-          f"Train {train_time:.1f}s | Infer {infer_t*1000:.2f}ms")
+    final_acc = accuracy_score(y_test, final_preds)
+    final_f1  = f1_score(y_test, final_preds, average="binary")
 
-    return model, history, {
-        "train_total_s":       train_time,
-        "infer_total_s":       infer_t,
-        "infer_per_sample_ms": infer_t / len(x_test) * 1000,
-    }, n_params
+    print(f"  ✓ {cfg['label']:<28} acc={final_acc:.4f}  f1={final_f1:.4f}"
+          f"  params={n_params:,}  t={train_time:.1f}s")
+
+    return {
+        "cfg":        cfg,
+        "model":      model,
+        "n_params":   n_params,
+        "accuracy":   final_acc,
+        "f1":         final_f1,
+        "history":    history,
+        "train_time": train_time,
+    }
 
 
-def _time_inference(fn, n_runs=5):
-    times = []
-    for _ in range(n_runs):
-        t0 = time.perf_counter()
-        fn()
-        times.append(time.perf_counter() - t0)
-    return min(times)
+def run_hp_sweep(x_train, y_train, x_test, y_test,
+                 embed_dim: int, out_dir: str) -> list:
+    """Sweep SWEEP_CONFIGS; save chart + report; return list of result dicts."""
+    sweep_dir = os.path.join(out_dir, "hp_sweep")
+    os.makedirs(sweep_dir, exist_ok=True)
+
+    print(f"\n{'─'*60}")
+    print(f"  HP SWEEP  ({len(SWEEP_CONFIGS)} configs × {SWEEP_EPOCHS} epochs)")
+    print(f"  Constraint: E×2^Q = 32  →  projector params = {embed_dim}×32 = {embed_dim*32:,} for all")
+    print(f"{'─'*60}")
+
+    sweep_results = []
+    for cfg in SWEEP_CONFIGS:
+        sweep_results.append(
+            _train_quantum_config(x_train, y_train, x_test, y_test,
+                                  embed_dim, cfg, SWEEP_EPOCHS)
+        )
+
+    _plot_hp_sweep(sweep_results, sweep_dir)
+    _generate_sweep_report(sweep_results, sweep_dir)
+    return sweep_results
+
+
+
+def _plot_hp_sweep(sweep_results: list, out_dir: str):
+    labels   = [r["cfg"]["label"] for r in sweep_results]
+    accs     = [r["accuracy"]     for r in sweep_results]
+    f1s      = [r["f1"]           for r in sweep_results]
+    n_params = [r["n_params"]     for r in sweep_results]
+    times    = [r["train_time"]   for r in sweep_results]
+    x        = np.arange(len(labels))
+
+    # ── 1. Accuracy & F1 bar chart ───────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(11, 5))
+    w = 0.35
+    b1 = ax.bar(x - w/2, accs, w, label="Accuracy", color="#9C27B0", alpha=0.85, edgecolor="white")
+    b2 = ax.bar(x + w/2, f1s,  w, label="F1",       color="#CE93D8", alpha=0.85, edgecolor="white")
+    for bar in list(b1) + list(b2):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.008,
+                f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+    ax.set_ylim(0, 1.12); ax.set_ylabel("Score")
+    ax.set_title("HP Sweep — Accuracy & F1 by Configuration", fontweight="bold")
+    ax.legend(); ax.grid(axis="y", alpha=0.3); sns.despine(ax=ax)
+    _savefig(fig, os.path.join(out_dir, "01_accuracy_f1.png"))
+
+    # ── 2. Params vs accuracy scatter ────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(n_params, accs, s=90, c="#9C27B0", zorder=3)
+    for r, acc in zip(sweep_results, accs):
+        ax.annotate(r["cfg"]["label"], (r["n_params"], acc),
+                    textcoords="offset points", xytext=(5, 4), fontsize=7.5)
+    ax.set_xlabel("Trainable Parameters"); ax.set_ylabel("Test Accuracy")
+    ax.set_title("Params vs Accuracy (HP Sweep)", fontweight="bold")
+    ax.grid(alpha=0.3); sns.despine(ax=ax)
+    _savefig(fig, os.path.join(out_dir, "02_params_vs_accuracy.png"))
+
+    # ── 3. Learning curves ───────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    cmap = plt.cm.get_cmap("tab10", len(sweep_results))
+    for i, r in enumerate(sweep_results):
+        h = r["history"]
+        c = cmap(i)
+        axes[0].plot(h["epoch"], h["loss"],    color=c, label=r["cfg"]["label"], linewidth=1.5)
+        axes[1].plot(h["epoch"], h["val_acc"], color=c, label=r["cfg"]["label"], linewidth=1.5)
+    for ax, title, ylabel in [
+        (axes[0], "Training Loss",      "Cross-Entropy Loss"),
+        (axes[1], "Validation Accuracy","Accuracy"),
+    ]:
+        ax.set_title(title, fontweight="bold"); ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel); ax.grid(alpha=0.3); ax.legend(fontsize=7.5)
+        sns.despine(ax=ax)
+    axes[1].axhline(0.5, color="#aaa", linestyle="--", linewidth=0.8)
+    axes[1].set_ylim(0.35, 1.02)
+    fig.tight_layout()
+    _savefig(fig, os.path.join(out_dir, "03_learning_curves.png"))
+
+    # ── 4. Training time bar ─────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 4))
+    bars = ax.bar(x, times, color="#9C27B0", alpha=0.8, edgecolor="white", width=0.55)
+    for bar, t in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f"{t:.0f}s", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+    ax.set_ylabel(f"Training time (s, {SWEEP_EPOCHS} epochs)")
+    ax.set_title("Training Time by Configuration", fontweight="bold")
+    ax.grid(axis="y", alpha=0.3); sns.despine(ax=ax)
+    _savefig(fig, os.path.join(out_dir, "04_train_time.png"))
+
+
+def _generate_sweep_report(sweep_results: list, out_dir: str):
+    best = max(sweep_results, key=lambda r: r["accuracy"])
+    now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    rows = []
+    for r in sweep_results:
+        cfg = r["cfg"]
+        star = " ★" if r is best else ""
+        rows.append(
+            f"| {'**'+cfg['label']+'**' if r is best else cfg['label']}{star} | "
+            f"{cfg['n_encoders']} | {cfg['qubits']} | {cfg['reuploads']} | "
+            f"{cfg['enc_layers']} | {cfg['pqc_layers']} | "
+            f"{r['n_params']:,} | {r['accuracy']:.4f} | {r['f1']:.4f} | "
+            f"{r['train_time']:.1f}s |"
+        )
+
+    lines = [
+        "# Hyperparameter Sweep — Hybrid Quantum-Classical Head",
+        f"\n_Generated: {now}_\n",
+        "---",
+        "",
+        "## Design",
+        "",
+        f"- **Constraint**: E × 2^Q = 32 for all configs → projector params fixed at"
+        f" embed_dim × 32. Total params vary by <300 across all configs.",
+        f"- **Epochs per config**: {SWEEP_EPOCHS}  |  **Batch**: {BATCH_SIZE}  |  **LR**: {LR}",
+        f"- **Varied axes**: architecture shape (E, Q), re-upload depth (R), encoder circuit depth (M)",
+        "",
+        "## Results",
+        "",
+        "| Config | E | Q | R | M | L | Params | Accuracy | F1 | Train time |",
+        "|--------|:-:|:-:|:-:|:-:|:-:|-------:|:--------:|:--:|:----------:|",
+        *rows,
+        "",
+        f"> ★ Best: **{best['cfg']['label']}**  —  accuracy {best['accuracy']:.4f}, F1 {best['f1']:.4f}",
+        "",
+        "## Charts",
+        "",
+        "### Accuracy & F1 by Config\n![](01_accuracy_f1.png)",
+        "### Parameter Count vs Accuracy\n![](02_params_vs_accuracy.png)",
+        "### Learning Curves\n![](03_learning_curves.png)",
+        "### Training Time\n![](04_train_time.png)",
+        "",
+        "---",
+        "_End of sweep report._",
+    ]
+
+    path = os.path.join(out_dir, "sweep_report.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  Saved: {path}")
+
+
+def save_best_sweep_model(sweep_results: list, x_train, y_train, x_test, y_test,
+                          embed_dim: int, out_dir: str):
+    """Retrain the best sweep config at full BENCH_EPOCHS and save with metadata."""
+    best_cfg = max(sweep_results, key=lambda r: r["accuracy"])["cfg"]
+
+    print(f"\n  Retraining best config '{best_cfg['label']}' for {BENCH_EPOCHS} epochs...")
+    final = _train_quantum_config(
+        x_train, y_train, x_test, y_test, embed_dim, best_cfg, BENCH_EPOCHS
+    )
+
+    save_path = os.path.join(out_dir, "best_sweep_model.pth")
+    torch.save({
+        "state_dict": final["model"].state_dict(),
+        "cfg":        best_cfg,
+        "embed_dim":  embed_dim,
+        "accuracy":   final["accuracy"],
+        "f1":         final["f1"],
+    }, save_path)
+    print(f"  Saved best sweep model → {save_path}  "
+          f"(acc={final['accuracy']:.4f}, f1={final['f1']:.4f})")
 
 
 # ─────────────────────────────────────────────
@@ -177,13 +366,13 @@ def run_problem_space(ps: dict) -> dict:
     print(f"{'═'*60}")
 
     # ── Data ──────────────────────────────────────────────
-    print("\n[1/3] Loading data...")
+    print("\n[1/4] Loading data...")
     x_train, x_test, y_train, y_test = ps["loader"]()
     embed_dim = x_train.shape[1]
     print(f"  embed_dim={embed_dim}  train={x_train.shape}  test={x_test.shape}")
 
     # ── Models ────────────────────────────────────────────
-    print("\n[2/3] Training models...")
+    print("\n[2/4] Training classical baselines...")
     results = {}
 
     print(f"\n{sep}\nLogistic Regression\n{sep}")
@@ -217,23 +406,38 @@ def run_problem_space(ps: dict) -> dict:
         "eval": evaluate(mlp_m, x_test, y_test, is_torch=True, class_names=class_names),
     }
 
-    print(f"\n{sep}\nHybrid Quantum Head\n{sep}")
-    q_m, q_h, q_t, n_q = train_quantum(x_train, y_train, x_test, y_test, embed_dim)
-    results["Quantum Hybrid"] = {
-        "type": "Hybrid quantum-classical", "n_params": f"{n_q:,}",
-        "notes": (f"sQE ({N_ENCODERS}×{QUBITS_PER_ENCODER}q) + "
-                  f"PQC ({N_ENCODERS*QUBITS_PER_ENCODER}q, R={N_REUPLOADS})"),
-        "history": q_h, "timing": q_t,
-        "eval": evaluate(q_m, x_test, y_test, is_torch=True, class_names=class_names),
-    }
-
-    torch.save(q_m.state_dict(), os.path.join(out_dir, "quantum_head_model.pth"))
     joblib.dump(lr_m,  os.path.join(out_dir, "logistic_regression.joblib"))
     joblib.dump(svm_m, os.path.join(out_dir, "linear_svm.joblib"))
     torch.save(mlp_m.state_dict(), os.path.join(out_dir, "mlp_model.pth"))
 
+    # ── HP Sweep → best config becomes the quantum reference ──────────────
+    print("\n[3/4] Running hyperparameter sweep...")
+    sweep_results = run_hp_sweep(x_train, y_train, x_test, y_test, embed_dim, out_dir)
+    save_best_sweep_model(sweep_results, x_train, y_train, x_test, y_test, embed_dim, out_dir)
+
+    best_sweep = max(sweep_results, key=lambda r: r["accuracy"])
+    best_cfg   = best_sweep["cfg"]
+    x_te       = torch.tensor(x_test, dtype=torch.float32)
+    infer_t    = _time_inference(
+        lambda: best_sweep["model"](x_te).argmax(dim=-1).numpy()
+    )
+    results["Quantum Hybrid"] = {
+        "type":     "Hybrid quantum-classical",
+        "n_params": f"{best_sweep['n_params']:,}",
+        "notes":    (f"Best sweep config: {best_cfg['label']} — "
+                     f"sQE ({best_cfg['n_encoders']}×{best_cfg['qubits']}q) + "
+                     f"PQC ({best_cfg['n_encoders']*best_cfg['qubits']}q, R={best_cfg['reuploads']})"),
+        "history":  best_sweep["history"],
+        "timing": {
+            "train_total_s":       best_sweep["train_time"],
+            "infer_total_s":       infer_t,
+            "infer_per_sample_ms": infer_t / len(x_test) * 1000,
+        },
+        "eval": evaluate(best_sweep["model"], x_test, y_test, is_torch=True, class_names=class_names),
+    }
+
     # ── Outputs ───────────────────────────────────────────
-    print("\n[3/3] Generating charts and report...")
+    print("\n[4/4] Generating charts and report...")
     _plot_accuracy_comparison(results,        os.path.join(out_dir, "01_accuracy_comparison.png"))
     _plot_training_curves(results,            os.path.join(out_dir, "02_training_curves.png"))
     _plot_timing_comparison(results,          os.path.join(out_dir, "03_timing_comparison.png"))

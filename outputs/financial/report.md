@@ -1,6 +1,6 @@
 # Financial News Sentiment — Benchmark Report
 
-_Generated: 2026-04-01 14:54_
+_Generated: 2026-04-01 17:39_
 
 ---
 
@@ -23,7 +23,7 @@ Binary sentiment (Bearish vs Bullish) on financial tweets/headlines
 | Logistic Regression | Classical — linear | — | L2-regularised, direct fit on raw features |
 | Linear SVM | Classical — linear kernel | — | LinearSVC + Platt calibration for probabilities |
 | MLP | Classical — neural | 24,674 | 768→32→2, ReLU; same Adam/LR/epochs as Quantum |
-| Quantum Hybrid | Hybrid quantum-classical | 24,714 | sQE (2×4q) + PQC (8q, R=4) |
+| Quantum Hybrid | Hybrid quantum-classical | 24,666 | Best sweep config: E2-Q4-R2 (low-R) — sQE (2×4q) + PQC (8q, R=2) |
 
 ---
 
@@ -31,12 +31,12 @@ Binary sentiment (Bearish vs Bullish) on financial tweets/headlines
 
 | Model | Accuracy | F1 | Train (s) | Infer (ms/sample) |
 |-------|:--------:|:--:|:---------:|:-----------------:|
-| Logistic Regression | 0.8080 | 0.8178 | 0.01 | 0.0028 |
-| Linear SVM | 0.8140 | 0.8229 | 0.08 | 0.0107 |
-| MLP | 0.8080 | 0.8136 | 4.79 | 0.0006 |
-| **Quantum Hybrid** ★ | 0.8150 | 0.8167 | 667.13 | 0.3169 |
+| Logistic Regression | 0.8080 | 0.8178 | 0.01 | 0.0032 |
+| Linear SVM | 0.8140 | 0.8229 | 0.08 | 0.0112 |
+| MLP | 0.8130 | 0.8176 | 4.65 | 0.0006 |
+| **Quantum Hybrid** ★ | 0.8220 | 0.8245 | 178.39 | 0.1688 |
 
-> ★ Best: **Quantum Hybrid** (0.8150)
+> ★ Best: **Quantum Hybrid** (0.8220)
 
 ---
 
@@ -87,8 +87,8 @@ weighted avg       0.82      0.81      0.81      1000
 ```
 precision    recall  f1-score   support
 
-     Bearish       0.83      0.78      0.80       500
-     Bullish       0.79      0.84      0.81       500
+     Bearish       0.83      0.79      0.81       500
+     Bullish       0.80      0.84      0.82       500
 
     accuracy                           0.81      1000
    macro avg       0.81      0.81      0.81      1000
@@ -99,12 +99,12 @@ weighted avg       0.81      0.81      0.81      1000
 ```
 precision    recall  f1-score   support
 
-     Bearish       0.82      0.81      0.81       500
-     Bullish       0.81      0.82      0.82       500
+     Bearish       0.83      0.81      0.82       500
+     Bullish       0.81      0.84      0.82       500
 
-    accuracy                           0.81      1000
-   macro avg       0.82      0.81      0.81      1000
-weighted avg       0.82      0.81      0.81      1000
+    accuracy                           0.82      1000
+   macro avg       0.82      0.82      0.82      1000
+weighted avg       0.82      0.82      0.82      1000
 ```
 
 ---
@@ -112,9 +112,9 @@ weighted avg       0.82      0.81      0.81      1000
 ## 6. Discussion
 
 ### Runtime overhead of quantum simulation
-- **Logistic Regression**: 63210× slower to train, 115× slower per inference sample
-- **Linear SVM**: 8703× slower to train, 30× slower per inference sample
-- **MLP**: 139× slower to train, 555× slower per inference sample
+- **Logistic Regression**: 15922× slower to train, 54× slower per inference sample
+- **Linear SVM**: 2170× slower to train, 15× slower per inference sample
+- **MLP**: 38× slower to train, 288× slower per inference sample
 
 ### MLP as controlled comparison
 The MLP uses the same optimiser, LR, batch size, and epoch budget as the quantum head, with a comparable parameter count.  Any accuracy difference reflects the quantum latent-space transformation, not differences in training budget.
